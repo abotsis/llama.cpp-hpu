@@ -241,6 +241,7 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
     // Difference vs Deepseek 3.2: shared indexer layers reuse the top_k from the previous full indexer layers
     // See https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L30
     ggml_tensor * prev_top_k = nullptr;
+    const bool all_keys = inp_attn_dsa->self_attn_mask_lid.n_kv <= n_indexer_top_k;
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -291,21 +292,23 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
                 const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
                 ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, k_idxs_lid, il));
 
-                // prepare indexer weights
-                ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, model.layers[il].indexer_proj, cur);
-                cb(indexer_weights, "indexer_weights", il);
+                // every cached key is selected while n_kv <= top k: plain causal attention (top_k stays null)
+                if (!all_keys) {
+                    // prepare indexer weights
+                    ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, model.layers[il].indexer_proj, cur);
+                    cb(indexer_weights, "indexer_weights", il);
 
-                // get cached indexer keys
-                indexer_k = mctx_lid->get_k(ctx0, il);
+                    // get cached indexer keys
+                    indexer_k = mctx_lid->get_k(ctx0, il);
 
-                // split the batch into streams if needed
-                const auto n_stream = indexer_k->ne[3];
-                indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
-                indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
+                    // split the batch into streams if needed
+                    const auto n_stream = indexer_k->ne[3];
+                    indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
+                    indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
 
-                // pre-scale weights to avoid scaling operations on huge indexer_score tensor
-                indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
-                cb(indexer_weights, "indexer_weights", il);
+                    // pre-scale weights to avoid scaling operations on huge indexer_score tensor
+                    indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
+                    cb(indexer_weights, "indexer_weights", il);
 
                 ggml_tensor * indexer_score = nullptr;
                 if (cparams.fused_lid) {
@@ -319,28 +322,28 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
                     indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
                     cb(indexer_k, "indexer_k", il);
 
-                    ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
-                    cb(indexer_kq, "indexer_kq", il);
+                        ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
+                        cb(indexer_kq, "indexer_kq", il);
 
-                    // ReLU requires contiguous tensors
-                    indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
-                    cb(indexer_kq, "indexer_kq", il);
+                        // ReLU requires contiguous tensors
+                        indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
+                        cb(indexer_kq, "indexer_kq", il);
 
-                    // apply ReLU
-                    indexer_score = ggml_relu(ctx0, indexer_kq);
-                    cb(indexer_score, "indexer_score", il);
+                        // apply ReLU
+                        indexer_score = ggml_relu(ctx0, indexer_kq);
+                        cb(indexer_score, "indexer_score", il);
 
-                    // multiply scores by indexer weights
-                    indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
-                    cb(indexer_score, "indexer_score", il);
+                        // multiply scores by indexer weights
+                        indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
+                        cb(indexer_score, "indexer_score", il);
 
-                    // sum by q n_indexer_head dimension
-                    indexer_score = ggml_sum_rows(ctx0, indexer_score);
-                    cb(indexer_score, "indexer_score", il);
+                        // sum by q n_indexer_head dimension
+                        indexer_score = ggml_sum_rows(ctx0, indexer_score);
+                        cb(indexer_score, "indexer_score", il);
 
-                    // permute result to match KQ mask
-                    indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
-                    cb(indexer_score, "indexer_score", il);
+                        // permute result to match KQ mask
+                        indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
+                        cb(indexer_score, "indexer_score", il);
 
                     // mask indexer scores
                     ggml_tensor * indexer_kq_mask = inp_attn_dsa->self_attn_mask_lid.raw;
@@ -351,13 +354,18 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
                 // get indices of top k indexer scores
                 uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
                 top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+                }
                 prev_top_k = top_k;
-                cb(top_k, "top_k", il);
+                if (top_k) {
+                    cb(top_k, "top_k", il);
+                }
             } else {
                 // "shared" indexer layer - reuse top-k from a previous full layer
-                GGML_ASSERT(prev_top_k != nullptr && "shared indexer layer must follow a previous full indexer layer");
+                GGML_ASSERT((all_keys || prev_top_k != nullptr) && "shared indexer layer must follow a previous full indexer layer");
                 top_k = prev_top_k;
-                cb(top_k, "top_k", il);
+                if (top_k) {
+                    cb(top_k, "top_k", il);
+                }
             }
 
             ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);

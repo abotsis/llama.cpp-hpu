@@ -136,6 +136,11 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid::get_can_pad() const {
+    // the rollback snapshots would hold the states of the pads
+    return mem_attn->get_can_pad() && mem_recr->n_rs_seq == 0;
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

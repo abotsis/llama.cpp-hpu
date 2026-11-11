@@ -391,6 +391,8 @@ llama_context::llama_context(
         }
     }
 
+    cparams.ubatch_pad = 0;
+
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
@@ -475,6 +477,27 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // devices holding weights outside the model's device list (tensor buffer overrides, e.g. one
+        // layer pinned to a single device of a tensor-split model) need a backend to run on
+        for (const auto & [buft, size] : model.memory_breakdown()) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || size == 0) {
+                continue;
+            }
+            bool have = false;
+            for (const auto & b : backends) {
+                have = have || ggml_backend_get_device(b.get()) == dev;
+            }
+            if (!have) {
+                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                }
+                LLAMA_LOG_INFO("%s: backend for overridden weights on %s\n", __func__, ggml_backend_dev_name(dev));
+                backends.emplace_back(backend);
+            }
+        }
+
         // tensors of ctx_other (e.g. a shared KV cache) can be on devices that this model does not use
         if (cparams.ctx_other) {
             for (const auto & dev_other : llama_get_model(cparams.ctx_other)->devices) {
@@ -548,6 +571,15 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // LLAMA_UBATCH_PAD: the prompt ubatches of one sequence are padded to a few sizes, for backends that compile a graph per shape
+        // only memory types and models that keep the pads out of their state (see llm_arch_supports_ubatch_pad)
+        if (memory && memory->get_can_pad() && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.causal_attn &&
+                cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && cparams.n_rs_seq == 0) {
+            cparams.ubatch_pad = llama_ubatch_pad_mode();
+
+            LLAMA_LOG_INFO("%s: ubatch_pad            = %u\n", __func__, cparams.ubatch_pad);
+        }
     }
 
     // init backends
@@ -2236,6 +2268,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    // the pads are not outputs: no padding when every token is one, or when other per-token data is extracted
+    if (cparams.ubatch_pad && cparams.causal_attn && n_outputs_all < n_tokens_all && batch_inp.n_embd == 0 && !cparams.embeddings_nextn &&
+            std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; })) {
+        balloc->set_pad(cparams.ubatch_pad);
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -4668,6 +4706,12 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+uint32_t llama_n_ubatch_pad(const llama_context * ctx, uint32_t n_tokens) {
+    const auto & cparams = ctx->get_cparams();
+
+    return llama_ubatch_pad_size(cparams.ubatch_pad, n_tokens, cparams.n_ubatch);
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {

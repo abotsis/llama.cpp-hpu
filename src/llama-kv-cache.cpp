@@ -92,12 +92,23 @@ llama_kv_cache::llama_kv_cache(
     // follows the source allocation: a fitted target can be smaller than the
     // draft default and oversized views would overflow the source tensors
     if (other) {
-        const uint32_t size_other = other->get_size();
+        const uint32_t size_other = other->get_size() - other->n_scratch;
         if (kv_size != size_other) {
             LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
             kv_size = size_other;
         }
     }
+
+    GGML_ASSERT(kv_size % n_pad == 0);
+
+    // the pad tokens of padded ubatches (llama_ubatch_pad_size) store their K/V in an extra cell that is never allocated
+    if (other) {
+        n_scratch = other->n_scratch;
+    } else if (llama_ubatch_pad_mode() != 0 && llm_arch_supports_ubatch_pad(model.arch)) {
+        n_scratch = 1;
+    }
+
+    kv_size += n_scratch;
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -1015,8 +1026,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         }
     }
 
-    uint32_t n_tokens = ubatch.n_tokens;
+    uint32_t n_tokens = ubatch.n_tokens - ubatch.n_pad;
     uint32_t n_seqs   = 1;
+
+    GGML_ASSERT(ubatch.n_pad == 0 || n_scratch > 0);
 
     if (n_stream > 1) {
         GGML_ASSERT(n_tokens % ubatch.n_seqs_unq == 0);
@@ -1050,6 +1063,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        // the scratch cell is not for use
+        const uint32_t size = cells.size() - n_scratch;
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -1058,8 +1074,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        if (n_tokens > size) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, size);
             return { };
         }
 
@@ -1070,8 +1086,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+            if (head_cur + n_test > size) {
+                n_tested += size - std::min(size, head_cur);
                 head_cur = 0;
                 continue;
             }
@@ -1129,7 +1145,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= size) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -1159,7 +1175,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         seq_pos_max_rm[s] = -1;
     }
 
-    assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+    assert(ubatch.n_tokens - ubatch.n_pad == sinfo.n_stream()*sinfo.size());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
@@ -1248,6 +1264,10 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+bool llama_kv_cache::get_can_pad() const {
+    return n_scratch > 0;
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
@@ -1316,10 +1336,25 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     const uint32_t n_pad = 256;
 
+    // LLAMA_KV_PAD_GEOM=1: pad to a multiple of max(n_pad_cur, 1/4 of the largest power of two <= used), so a
+    // growing context goes through ~4 n_kv values per doubling instead of one per 256 cells (backends that
+    // compile a graph per shape); at most 1/4 extra masked cells
+    static const bool pad_geom = getenv("LLAMA_KV_PAD_GEOM") && atoi(getenv("LLAMA_KV_PAD_GEOM")) != 0;
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad, GGML_PAD(cells.used_max_p1(), n_pad))), result);
+        uint32_t pad = n_pad;
+        if (pad_geom) {
+            const uint32_t used = cells.used_max_p1();
+            uint32_t p2 = 1;
+            while (used > 0 && p2 <= used / 2) {
+                p2 *= 2;
+            }
+            pad = std::max(pad, p2 / 4);
+        }
+
+        result = std::max(std::min(cells.size() - n_scratch, std::max(pad, GGML_PAD(cells.used_max_p1(), pad))), result);
     }
 
     return result;
@@ -1631,7 +1666,7 @@ std::vector<ggml_tensor *> llama_kv_cache::get_v_rot() const {
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
-    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(n_tokens - ubatch->n_pad == (int64_t) sinfo.size()*sinfo.n_stream());
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
@@ -1643,11 +1678,21 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
     }
+
+    // the pads write to the scratch cell, the last one of the stream
+    if (ubatch->n_pad > 0) {
+        GGML_ASSERT(n_scratch > 0 && sinfo.n_stream() == 1);
+
+        for (uint32_t i = sinfo.size(); i < n_tokens; ++i) {
+            data[i] = (sinfo.strm[0] + 1)*get_size() - 1;
+        }
+    }
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
-    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(n_tokens - ubatch->n_pad == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(ubatch->n_pad == 0 || (n_scratch > 0 && sinfo.n_stream() == 1));
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
@@ -1659,6 +1704,10 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
             }
+        }
+
+        for (uint32_t i = n_tokens - ubatch->n_pad; i < n_tokens; ++i) {
+            data[i] = (sinfo.strm[0] + 1)*get_size() - 1;
         }
     } else {
         // note: the V cache is transposed when not using flash attention
@@ -1673,6 +1722,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                     data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
                 }
+            }
+        }
+
+        for (uint32_t i = n_tokens - ubatch->n_pad; i < n_tokens; ++i) {
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                data[i*n_embd_v_gqa + j] = sinfo.strm[0]*kv_size*n_embd_v_gqa + j*kv_size + kv_size - 1;
             }
         }
     }
@@ -2520,7 +2575,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
     if (dest_seq_id != -1) {
         // single sequence
-        if (cell_count > cells.size()) {
+        if (cell_count > cells.size() - n_scratch) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
         }
@@ -2636,7 +2691,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     } else {
         // whole KV cache restore
 
-        if (cell_count > cells.size()) {
+        if (cell_count > cells.size() - n_scratch) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
         }
@@ -2728,8 +2783,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         return false;
     }
 
-    if (cell_count > cells.size()) {
-        LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, cells.size());
+    if (cell_count > cells.size() - n_scratch) {
+        LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, cells.size() - n_scratch);
         return false;
     }
 

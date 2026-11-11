@@ -134,6 +134,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_can_pad()   const override;
 
     void clear(bool data) override;
 
@@ -287,6 +288,12 @@ private:
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+
+    // required padding
+    const uint32_t n_pad = 1;
+
+    // 1: one extra cell per stream, the last one, takes the K/V of the pad tokens of a padded ubatch
+    uint32_t n_scratch = 0;
 
     // SWA
     const uint32_t n_swa = 0;

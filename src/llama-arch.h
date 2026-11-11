@@ -975,3 +975,5 @@ bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
 bool llm_arch_supports_mixed_batch(const llm_arch & arch);
+// pad ubatches of one sequence to a few sizes (llama_ubatch_pad_size): attention and GDN (delta-net-base) models
+bool llm_arch_supports_ubatch_pad(const llm_arch & arch);

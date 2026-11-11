@@ -1248,6 +1248,9 @@ struct ggml_backend_sched {
 
     int debug_realloc;
 
+    // GGML_SCHED_ALLOC_FRESH: allocate every graph from a plan of its own, not from the plan of an earlier graph with as
+    // many nodes, so tensor addresses depend only on the graph (backends that compile and cache a graph per addresses)
+    bool alloc_fresh;
     // inputs of the next split read from the backend of the current split before it computes, see ggml_backend_sched_prefetch_inputs
     ggml_backend_event_t prefetch_events[GGML_SCHED_MAX_BACKENDS]; // created on first use, NULL if the backend has no events
     bool                 prefetch_tried [GGML_SCHED_MAX_BACKENDS];
@@ -2046,7 +2049,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    if (backend_ids_changed || sched->alloc_fresh || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -2054,11 +2057,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // a reallocation with an unchanged graph size means that the previous reservation was not sufficient
         const bool graph_size_changed = sched->prev_graph_size != sched->graph_size;
 
-        if (sched->callback_realloc != NULL) {
+        if (sched->callback_realloc != NULL && !sched->alloc_fresh) {
             sched->callback_realloc(sched, &sched->graph, backend_ids_changed, graph_size_changed, sched->callback_realloc_user_data);
         }
 
-        if (sched->debug_realloc > 0) {
+        if (sched->debug_realloc > 0 && !sched->alloc_fresh) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
             const bool unexpected = !backend_ids_changed && !graph_size_changed;
@@ -2313,6 +2316,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+
+    const char * GGML_SCHED_ALLOC_FRESH = getenv("GGML_SCHED_ALLOC_FRESH");
+    sched->alloc_fresh = GGML_SCHED_ALLOC_FRESH && atoi(GGML_SCHED_ALLOC_FRESH) != 0;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;

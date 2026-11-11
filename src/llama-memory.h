@@ -132,6 +132,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // true if init_batch() takes the padded ubatches of llama_batch_allocr::set_pad()
+    virtual bool get_can_pad() const { return false; }
+
     //
     // ops
     //

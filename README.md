@@ -90,6 +90,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
 | [SYCL](docs/backend/SYCL.md) | Intel GPU |
+| [SYNAPSE](docs/backend/SYNAPSE.md) | Intel Gaudi2 |
 | [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
 | [Vulkan](docs/build.md#vulkan) | GPU |
 | [WebGPU](docs/build.md#webgpu) | All |

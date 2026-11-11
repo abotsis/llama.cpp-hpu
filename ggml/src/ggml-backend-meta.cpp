@@ -1320,7 +1320,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
                 // The offset can be internal to the data split, in those cases the view offset should not be scaled.
                 // If however, the offset is larger than the data split then it needs to be scaled proportionally.
-                bool split_internal_offset = t_ij->view_offs <= tensor->view_src->nb[split_dim_view_src];
+                bool split_internal_offset = t_ij->view_offs <= tensor->view_src->nb[split_dim_view_src] ||
+                    // within one element of the split dim (e.g. the rope part of each head): the same on every slice
+                    t_ij->view_offs < tensor->nb[split_dim];
                 for (int i = 0; i < GGML_MAX_DIMS; i++) {
                     const size_t dim_size = tensor->ne[i] * tensor->nb[i];
                     if (tensor->view_offs <= dim_size && dim_size < tensor->nb[split_dim]) {
@@ -2040,10 +2042,14 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // TODO other simple backend may be better
-            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
-            ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
+            // every backend holds the same data: a large read takes a slice from each, the copies run concurrently
+            const size_t n_parts = size >= (256u << 10) ? n_backends : 1;
+            const size_t part = GGML_PAD((size + n_parts - 1)/n_parts, 128);
+            for (size_t j = 0, done = 0; j < n_parts && done < size; j++, done += part) {
+                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                ggml_backend_tensor_get_async(simple_backend, simple_tensor, (char *) data + done, offset + done, std::min(part, size - done));
+            }
         } break;
         default: {
             GGML_ABORT("fatal error");

@@ -37,6 +37,7 @@
 /common/ngram-map.*                     @srogmann
 /conversion/                            @CISC
 /convert_*.py                           @CISC
+/docs/backend/SYNAPSE.md                @abotsis
 /docs/backend/snapdragon/               @ggml-org/ggml-hexagon
 /examples/                              @ggml-org/llama-examples
 /examples/debug/                        @danbev @pwilkin
@@ -46,6 +47,7 @@
 /examples/model-conversion/             @danbev
 /ggml/cmake/                            @ggerganov
 /ggml/include/                          @ggerganov
+/ggml/include/ggml-synapse.h            @abotsis
 /ggml/src/ggml-backend-meta.cpp         @JohannesGaessler
 /ggml/src/ggml-cann/                    @ggml-org/ggml-cann
 /ggml/src/ggml-common.h                 @ggerganov
@@ -65,6 +67,7 @@
 /ggml/src/ggml-quants.*                 @ggerganov
 /ggml/src/ggml-rpc/                     @ggml-org/ggml-rpc
 /ggml/src/ggml-sycl/                    @ggml-org/ggml-sycl
+/ggml/src/ggml-synapse/                 @abotsis
 /ggml/src/ggml-threading.*              @ggerganov
 /ggml/src/ggml-virtgpu/                 @kpouget
 /ggml/src/ggml-vulkan/                  @ggml-org/ggml-vulkan

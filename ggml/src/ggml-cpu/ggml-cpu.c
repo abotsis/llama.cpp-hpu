@@ -1261,6 +1261,33 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// n elements of a src1 row (a multiple of vec_dot_type's block size) in vec_dot_type: F32 packed by
+// from_float, F16 / BF16 widened to F32 first (into dst when vec_dot_type is F32)
+static void ggml_cpu_pack_src1(enum ggml_type src1_type, enum ggml_type vec_dot_type, ggml_from_float_t from_float,
+                               const void * src, void * dst, int64_t n) {
+    if (src1_type == GGML_TYPE_F32) {
+        from_float((const float *) src, dst, n);
+        return;
+    }
+    GGML_ASSERT(src1_type == GGML_TYPE_F16 || src1_type == GGML_TYPE_BF16);
+    enum { CHUNK = 1024 };
+    float tmp[CHUNK];
+    GGML_ASSERT(vec_dot_type == GGML_TYPE_F32 || CHUNK % ggml_blck_size(vec_dot_type) == 0);
+    const size_t ts = ggml_type_size(src1_type);
+    for (int64_t i = 0; i < n; i += CHUNK) {
+        const int64_t m = MIN(CHUNK, n - i);
+        float * f = vec_dot_type == GGML_TYPE_F32 ? (float *) dst + i : tmp;
+        if (src1_type == GGML_TYPE_F16) {
+            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) ((const char *) src + i*ts), f, m);
+        } else {
+            ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) ((const char *) src + i*ts), f, m);
+        }
+        if (vec_dot_type != GGML_TYPE_F32) {
+            from_float(tmp, (char *) dst + ggml_row_size(vec_dot_type, i), m);
+        }
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1346,11 +1373,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
-        const bool widen = src1->type != GGML_TYPE_F32;
-
-        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
-        GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
+        // src1 (F32, F16 or BF16) packed into vec_dot_type
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1375,13 +1398,7 @@ UseGgmlGemm1:;
 
                     const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
 
-                    if (src1->type == GGML_TYPE_F16) {
-                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
-                    } else if (src1->type == GGML_TYPE_BF16) {
-                        ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
-                    } else {
-                        from_float((const float *) src1_row, wdata_row, ne10_block_size);
-                    }
+                    ggml_cpu_pack_src1(src1->type, vec_dot_type, from_float, src1_row, wdata_row, ne10_block_size);
                 }
             }
         }
@@ -1630,7 +1647,6 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1649,9 +1665,10 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    ggml_cpu_pack_src1(src1->type, vec_dot_type, from_float,
+                                       (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10,
+                                       wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0,
+                                       (ne10_block_end - ne10_block_start) * bs);
                 }
             }
         }

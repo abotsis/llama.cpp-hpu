@@ -660,17 +660,20 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     }
 
     // update the pos of the used seqs
+    // the pad tokens of a padded ubatch (one sequence) are not part of the state
+    const uint32_t n_seq_tokens_real = n_seq_tokens - ubatch.n_pad;
+
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens;
-        const llama_pos last_pos = ubatch.pos[i + n_seq_tokens - 1];
+        const llama_pos last_pos = ubatch.pos[i + n_seq_tokens_real - 1];
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens_real) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
-                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens_real);
         }
         cell.pos = last_pos;
         cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0;

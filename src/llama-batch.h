@@ -43,6 +43,7 @@ struct llama_ubatch {
     uint32_t n_seqs;       // sequence sets in the ubatch
     uint32_t n_seqs_unq;   // unique sequence ids in the ubatch
     uint32_t n_pos;        // number of position inputs for each token/embedding
+    uint32_t n_pad;        // trailing pad tokens (included in n_tokens), see llama_ubatch_pad_size()
 
     // seq_id_unq: unique sequence ids in the ubatch
     // seq_idx:    indices of the unique sequence ids in the ubatch in [0, n_seqs_unq)
@@ -87,6 +88,15 @@ struct llama_ubatch {
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
 #define ASSERT_EMBD_OR_TOKEN(ubatch) GGML_ASSERT(!(ubatch).is_mixed() && "mixed token/embd ubatch is not supported here")
+
+// token-dim padding of single-sequence ubatches, for backends that compile one graph per shape
+// the pads copy the last real token (id, pos, seq), are never outputs and leave the memory untouched
+// env LLAMA_UBATCH_PAD: 0 - off (default), 1 - quarter-octave buckets, 2 - powers of two
+uint32_t llama_ubatch_pad_mode();
+
+// the size a ubatch of n_tokens tokens of one sequence is padded to, at most n_ubatch
+// mode 1: 1, 8, 16 .. 64 in steps of 16, then 4 steps per doubling (80, 96, 112, 128, 160, .. 448, 512, 640, ..)
+uint32_t llama_ubatch_pad_size(uint32_t mode, uint32_t n_tokens, uint32_t n_ubatch);
 
 struct llama_hparams;
 
@@ -200,12 +210,20 @@ public:
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
 
+    // pad the single-sequence ubatches of the current batch (mode of llama_ubatch_pad_size, 0 - off)
+    // reset by init()
+    void set_pad(uint32_t mode);
+
 private:
     void clear();
 
+    // the pad tokens for a ubatch of the given batch indices
+    uint32_t n_pad_for(const std::vector<int32_t> & idxs, uint32_t n_ubatch) const;
+
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
+    // n_pad trailing pad tokens copy the last of idxs, n_seqs counts them
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
-    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
+    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs, uint32_t n_pad = 0);
 
     // for debugging, start with LLAMA_BATCH_DEBUG=2
     void ubatch_print(const llama_ubatch & ubatch, int debug);
@@ -266,7 +284,12 @@ private:
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;
 
+    uint32_t pad_mode = 0;
+
     int debug;
+
+    // env: LLAMA_UBATCH_PAD_DEBUG - pad token ids: 0 - copy of the last token, 1 - token 0, 2 - pseudo-random
+    int pad_debug;
 };
 
 // RAII translation layer: converts a llama_batch (old API) into a llama_batch_ext

@@ -458,6 +458,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    ggml_tensor * qkv_rows = qkv_mixed; // [conv_channels, n_seq_tokens, n_seqs]
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
@@ -489,6 +491,16 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
+
+    // the pads of a padded ubatch neither decay nor update the state
+    if (inp->tok_valid) {
+        GGML_ASSERT(b->ne[0] == 1 && ggml_nelements(inp->tok_valid) == ggml_nelements(b));
+
+        ggml_tensor * valid = ggml_reshape_4d(ctx0, inp->tok_valid, 1, H_v, n_seq_tokens, n_seqs);
+
+        g = ggml_mul(ctx0, g, valid);
+        b = ggml_mul(ctx0, b, valid);
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);

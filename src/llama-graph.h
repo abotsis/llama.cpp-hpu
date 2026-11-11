@@ -316,6 +316,13 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // ubatches with pads (llama_ubatch.n_pad), only for a size that can hold them: the pads must not change the state
+    ggml_tensor * tok_valid = nullptr; // F32 [n_head_v, n_seq_tokens, n_seqs]: 1 for the real tokens, 0 for the pads
+    ggml_tensor * conv_tail = nullptr; // I32 [d_conv - 1, n_seqs]: the rows of the new conv state (build_conv_state)
+    int64_t       conv_lo   = 0;       // the fewest real tokens a ubatch of this size holds
+
+    void set_input_pad(const llama_ubatch * ubatch);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -849,6 +856,7 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            (ubatch.n_pad == 0) == (other.ubatch.n_pad == 0) &&
             ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||

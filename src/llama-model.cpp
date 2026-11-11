@@ -572,6 +572,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
 
+        // GLM-DSA (absorbed MLA): one latent KV head shared by all heads, so the latent projections, the
+        // latent cache and the indexer are mirrored; the query up-projection, the per-head k_b / v_b and the
+        // output projection split by heads
+        if (ud->model->arch == LLM_ARCH_GLM_DSA) {
+            static const std::regex pattern_mla_kv_b("blk\\.\\d*\\.attn_(k|v)_b\\.weight");
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_mla_kv_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+
         // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
         if (std::regex_match(tensor_name, pattern_idx_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -838,6 +861,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 blck_size_perf *= 2;
             }
 
+            if (ud->model->arch == LLM_ARCH_GLM_DSA) {
+                // whole heads: q_b rows and attn_output columns per head, k_b / v_b one head per step
+                const int64_t n_head = hparams.n_head(il);
+                if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+                    GGML_ASSERT(segments.size() == 1 && tensor->ne[1] % n_head == 0);
+                    return {tensor->ne[1] / n_head};
+                }
+                if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                    GGML_ASSERT(segments.size() == 1 && tensor->ne[0] % n_head == 0);
+                    return {std::lcm(tensor->ne[0] / n_head, blck_size)};
+                }
+                if (tensor_name.find("attn_k_b") != std::string::npos || tensor_name.find("attn_v_b") != std::string::npos) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {1};
+                }
+            }
             const int64_t granularity_q    = std::lcm(n_embd_q, blck_size_perf);
             const int64_t granularity_head = granularity_q / hparams.n_embd_head_k(il); // for tensors with one value per head
             if (std::regex_match(tensor_name, pattern_attn_gate_bias)) {

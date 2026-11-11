@@ -11,9 +11,17 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <condition_variable>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
 #include <unordered_set>
+
+#ifndef _WIN32
+#include <cerrno>
+#include <unistd.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1644,6 +1652,112 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+#ifndef _WIN32
+namespace {
+// staged reads (no mapping, no async upload backend): a reader thread reads the next tensors ahead with
+// parallel positional reads (several requests in flight read faster from RAID / ZFS than one stream)
+// into two buffers taken in turn, while the main loop uploads the current one
+struct staged_prefetch {
+    struct job {
+        int fd;
+        size_t offs, n;
+    };
+    std::vector<job> jobs;   // in loop order
+    std::vector<no_init<uint8_t>> buf[2];
+    size_t held[2] = { 0, 0 };   // job index + 1 in each buffer
+    size_t released = 0;         // jobs the main loop is done with
+    bool stop = false;
+    std::string err;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::thread th;
+
+    static bool pread_all(int fd, uint8_t * dst, size_t n, size_t offs) {
+        while (n > 0) {
+            const ssize_t r = pread(fd, dst, n, (off_t) offs);
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            if (r <= 0) {
+                return false;
+            }
+            dst += r;
+            offs += (size_t) r;
+            n -= (size_t) r;
+        }
+        return true;
+    }
+
+    void run() {
+        for (size_t j = 0; j < jobs.size(); j++) {
+            const int s = j & 1;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&] { return stop || released + 2 > j; });   // job j - 2 (same buffer) done
+                if (stop) {
+                    return;
+                }
+            }
+            const job & jb = jobs[j];
+            if (buf[s].size() < jb.n) {
+                buf[s] = std::vector<no_init<uint8_t>>(jb.n);
+            }
+            const size_t nparts = std::max<size_t>(1, std::min<size_t>(4, jb.n / ((size_t) 64 << 20)));
+            const size_t part = (jb.n + nparts - 1) / nparts;
+            std::vector<std::thread> rd;
+            std::vector<char> ok(nparts, 1);
+            for (size_t p = 1; p < nparts; p++) {
+                rd.emplace_back([&, p] {
+                    const size_t o = p * part;
+                    ok[p] = pread_all(jb.fd, (uint8_t *) buf[s].data() + o, std::min(part, jb.n - o), jb.offs + o);
+                });
+            }
+            ok[0] = pread_all(jb.fd, (uint8_t *) buf[s].data(), std::min(part, jb.n), jb.offs);
+            for (auto & t : rd) {
+                t.join();
+            }
+            std::lock_guard<std::mutex> lk(mtx);
+            if (std::find(ok.begin(), ok.end(), 0) != ok.end()) {
+                err = "read error";
+                stop = true;
+            }
+            held[s] = j + 1;
+            cv.notify_all();
+            if (stop) {
+                return;
+            }
+        }
+    }
+
+    const uint8_t * get(size_t j) {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait(lk, [&] { return held[j & 1] == j + 1 || !err.empty(); });
+        if (!err.empty()) {
+            throw std::runtime_error("failed to read model data: " + err);
+        }
+        return (const uint8_t *) buf[j & 1].data();
+    }
+
+    void release(size_t j) {
+        std::lock_guard<std::mutex> lk(mtx);
+        released = j + 1;
+        cv.notify_all();
+    }
+
+    ~staged_prefetch() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+};
+} // namespace
+#endif
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         std::vector<ggml_backend_buffer_t> & bufs,
@@ -1777,6 +1891,24 @@ bool llama_model_loader::load_all_data(
 
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     std::vector<no_init<uint8_t>> read_buf;
+#ifndef _WIN32
+    staged_prefetch pf;
+    size_t pf_next = 0;
+    static const bool no_prefetch = getenv("LLAMA_NO_LOAD_PREFETCH") != nullptr;
+    if (!upload_backend && !use_mmap && !use_direct_io && !no_prefetch) {
+        for (struct ggml_tensor * cur : tensors) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (weight && !lazy.has(cur) && !ggml_backend_buffer_is_host(cur->buffer)) {
+                pf.jobs.push_back({ files.at(weight->idx)->file_id(), weight->offs, ggml_nbytes(cur) });
+            }
+        }
+        if (pf.jobs.size() > 1) {
+            pf.th = std::thread([&pf] { pf.run(); });
+        } else {
+            pf.jobs.clear();
+        }
+    }
+#endif
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1896,6 +2028,21 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
+#ifndef _WIN32
+                    if (!pf.jobs.empty()) {
+                        // read ahead by the prefetch thread (same order as this loop)
+                        const size_t j = pf_next++;
+                        GGML_ASSERT(j < pf.jobs.size() && pf.jobs[j].offs == weight->offs && pf.jobs[j].n == n_size);
+                        const uint8_t * data = pf.get(j);
+                        ggml_backend_tensor_set(cur, data, 0, n_size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
+                        pf.release(j);
+                        size_done += n_size;
+                        continue;
+                    }
+#endif
                     // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
                     const size_t align          = file->read_alignment();
                     const size_t aligned_offset = weight->offs & ~(align - 1);

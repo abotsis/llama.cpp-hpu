@@ -16,6 +16,9 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
 
+    const char * LLAMA_UBATCH_PAD_DEBUG = getenv("LLAMA_UBATCH_PAD_DEBUG");
+    pad_debug = LLAMA_UBATCH_PAD_DEBUG ? atoi(LLAMA_UBATCH_PAD_DEBUG) : 0;
+
     seq_pos.resize(LLAMA_MAX_SEQ);
     seq_cpl.resize(LLAMA_MAX_SEQ);
     for (auto & cur : seq_cpl) {
@@ -30,6 +33,8 @@ bool llama_batch_allocr::init(
         const llama_vocab & vocab,
         bool output_all) {
     clear();
+
+    pad_mode = 0;
 
     this->vocab        = &vocab;
     this->n_embd       = batch_inp.n_embd > 0 ? batch_inp.n_embd : batch_inp.n_embd_inp;
@@ -341,6 +346,7 @@ bool llama_batch_allocr::init(
             /*.n_seqs       =*/ (uint32_t) batch.n_tokens,
             /*.n_seqs_unq   =*/ (uint32_t) this->seq_id_unq.size(),
             /*.n_pos        =*/ n_pos_per_embd,
+            /*.n_pad        =*/ 0,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
             /*.embd_state   =*/ state_vec.empty() ? nullptr : state_vec.data(),
@@ -566,6 +572,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ n_seqs,
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.n_pad        =*/ 0,
 
         /*.token        =*/ udata->token.data(),
         /*.embd         =*/ nullptr,
@@ -583,6 +590,10 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     };
 
     return res;
+}
+
+void llama_batch_allocr::set_pad(uint32_t mode) {
+    pad_mode = mode;
 }
 
 const llama_batch & llama_batch_allocr::get_batch() const {
@@ -622,7 +633,26 @@ void llama_batch_allocr::split_reset() {
     used.resize(get_n_tokens(), false);
 }
 
+// DEAD CODE (off by default since 2026-10-28; kept for reference, to be removed): LLAMA_UBATCH_POW2=1: with fewer than
+// n_ubatch tokens left, a ubatch takes the largest power of two of them, down to 8 (the last <= 8 tokens at once, e.g.
+// a few sequences decoding), so ubatch sizes come from a small set (n_ubatch, 256, 128, .., 8, 1 .. 7) instead of every
+// remainder of a batch. Bounds the graphs a backend compiling per shape needs, but each extra ubatch reads the weights
+// again: Qwen3.8-27B prefill -12 .. -26% (WORKLOG 2026-10-27/28)
+static uint32_t ubatch_cap(uint32_t n_ubatch, uint32_t n_left) {
+    static const bool pow2 = getenv("LLAMA_UBATCH_POW2") && atoi(getenv("LLAMA_UBATCH_POW2")) != 0;
+    if (!pow2 || n_left >= n_ubatch || n_left <= 8) {
+        return n_ubatch;
+    }
+    uint32_t p = 8;
+    while (p <= n_left / 2) {
+        p *= 2;
+    }
+    return p;
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    n_ubatch = ubatch_cap(n_ubatch, (uint32_t) used.size() - n_used);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -653,7 +683,9 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
         }
     }
 
-    return ubatch_add(idxs, idxs.size(), false);
+    const uint32_t n_pad = n_pad_for(idxs, n_ubatch);
+
+    return ubatch_add(idxs, idxs.size() + n_pad, false, n_pad);
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
@@ -662,6 +694,8 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
         return {};
     }
+
+    n_ubatch = ubatch_cap(n_ubatch, (uint32_t) used.size() - n_used);
 
     std::vector<seq_set_t> cur_seq_set;
 
@@ -824,10 +858,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         idxs.insert(idxs.end(), idxs_per_seq[s].begin(), idxs_per_seq[s].end());
     }
 
-    return ubatch_add(idxs, n_seqs, true);
+    return ubatch_add(idxs, n_seqs, true, n_seqs == 1 ? n_pad_for(idxs, n_ubatch) : 0);
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+    n_ubatch = ubatch_cap(n_ubatch, (uint32_t) used.size() - n_used);
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -903,8 +939,58 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
-llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
-    const uint32_t n_tokens = idxs.size();
+uint32_t llama_ubatch_pad_mode() {
+    const char * env = getenv("LLAMA_UBATCH_PAD");
+
+    return env ? (uint32_t) std::max(0, atoi(env)) : 0;
+}
+
+uint32_t llama_ubatch_pad_size(uint32_t mode, uint32_t n_tokens, uint32_t n_ubatch) {
+    // up to 8 tokens exact: tiny chunks (llama-server's last 4 before a checkpoint) cost little to compile and a
+    // padded one loses the small-T paths (GDN models: 20-26 -> 32 ms per chunk on Qwen3.8-27B)
+    if (mode == 0 || n_tokens <= 8) {
+        return n_tokens;
+    }
+
+    uint32_t res = 8;
+
+    if (mode == 2) {
+        while (res < n_tokens) {
+            res *= 2;
+        }
+    } else if (n_tokens > 64) {
+        // p: the largest power of two below n_tokens
+        uint32_t p = 64;
+        while (2*p < n_tokens) {
+            p *= 2;
+        }
+        res = GGML_PAD(n_tokens, p/4);
+    } else if (n_tokens > 8) {
+        res = GGML_PAD(n_tokens, 16);
+    }
+
+    return std::max(n_tokens, std::min(res, n_ubatch));
+}
+
+uint32_t llama_batch_allocr::n_pad_for(const std::vector<int32_t> & idxs, uint32_t n_ubatch) const {
+    // token ubatches of a single sequence only
+    if (pad_mode == 0 || idxs.size() <= 1 || !batch.token || batch.embd || !state_vec.empty() || !decision_order.empty()) {
+        return 0;
+    }
+
+    const llama_seq_id seq_id0 = batch.seq_id[idxs[0]][0];
+
+    for (int32_t idx : idxs) {
+        if (batch.n_seq_id[idx] != 1 || batch.seq_id[idx][0] != seq_id0) {
+            return 0;
+        }
+    }
+
+    return llama_ubatch_pad_size(pad_mode, idxs.size(), n_ubatch) - idxs.size();
+}
+
+llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs, uint32_t n_pad) {
+    const uint32_t n_tokens = idxs.size() + n_pad;
 
     assert(n_tokens%n_seqs == 0);
 
@@ -997,8 +1083,30 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
     }
 
+    // the pads copy the last token, without an output
+    for (uint32_t i = idxs.size(); i < n_tokens; ++i) {
+        const int32_t idx = idxs.back();
+
+        udata->token[i] = batch.token[idx];
+        if (pad_debug == 1) {
+            udata->token[i] = 0;
+        } else if (pad_debug == 2) {
+            udata->token[i] = (llama_token) ((i*2654435761u + 12345u) % (uint32_t) vocab->n_tokens());
+        }
+
+        for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
+            udata->pos[j*n_tokens + i] = batch.pos[j*batch.n_tokens + idx];
+        }
+
+        udata->n_seq_id[i] = 1;
+        udata->output[i]   = 0;
+
+        udata->batch_idxs.push_back(idx);
+        udata->seq_id_data.push_back(batch.seq_id[idx][0]);
+    }
+
     llama_seq_id * seq_id_ptr = udata->seq_id_data.data();
-    for (size_t i = 0; i < idxs.size(); ++i) {
+    for (size_t i = 0; i < n_tokens; ++i) {
         udata->seq_id[i] = seq_id_ptr;
         seq_id_ptr += udata->n_seq_id[i];
     }
@@ -1017,6 +1125,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
+        /*.n_pad        =*/ n_pad,
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
         /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,

@@ -613,6 +613,17 @@ llama_new_context_with_model:       CANN compute buffer size =  1260.81 MiB
 
 For detailed info, such as model/device supports, CANN install, please refer to [llama.cpp for CANN](./backend/CANN.md).
 
+## SYNAPSE
+
+The SYNAPSE backend runs llama.cpp on Intel Gaudi2 accelerators through SynapseAI (Linux x86-64 only).
+
+```bash
+cmake -B build -DGGML_SYNAPSE=ON
+cmake --build build --config Release
+```
+
+For detailed info, please refer to [llama.cpp for Intel Gaudi2 (SYNAPSE)](./backend/SYNAPSE.md).
+
 ## ZenDNN
 
 ZenDNN provides optimized deep learning primitives for AMD EPYC™ CPUs. It accelerates matrix multiplication operations for inference workloads.
